@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from .tokenize import AggregatedTokenizer
 
+
 class AggregatedGenerator:
     def __init__(
         self, 
@@ -33,9 +34,7 @@ class AggregatedGenerator:
         valid_tokenizes_inds = [[] for _ in range(n_models)]
         agg_tokenizer_inds = [[] for _ in range(n_models)]
         valid_to_agg_inds = [[] for _ in range(n_models)]
-        
-        
-        
+
         for model_id in range(len(self.models)):
             next_token_logits_tuple = self.models[model_id].generate(
                 **encoders_inputs[model_id], 
@@ -53,11 +52,9 @@ class AggregatedGenerator:
                     agg_token_id = self.agg_tokenizer.vocab[token_str]   
                     agg_tokenizer_inds[model_id].append(agg_token_id)
                     valid_tokenizes_inds[model_id].append(token_ind)
-            
-            valid_logits = next_token_logits[valid_tokenizes_inds[model_id]]
-            
+
             for valid_token_ind, agg_token_id in enumerate(agg_tokenizer_inds[model_id]):
-                valid_to_agg_inds[model_id].append(agg_token_id) # valid_token_ind --> agg_token_id
+                valid_to_agg_inds[model_id].append(agg_token_id)  # valid_token_ind --> agg_token_id
             
         self._valid_tokenizes_inds = valid_tokenizes_inds
         self._agg_tokenizer_inds = agg_tokenizer_inds
@@ -68,7 +65,7 @@ class AggregatedGenerator:
     @torch.no_grad()
     def _generate_agg_next_top_k_p(
         self, 
-        encoders_inputs: list[list[int]] | list[torch.Tensor], 
+        encoders_inputs: list[dict],
         decoder_input_text: list[int] | torch.Tensor | None,
         agg_decoder_input_ids: list[int] | torch.Tensor | None,
         device: str = "cuda",
@@ -215,9 +212,10 @@ class AggregatedGenerator:
             for model_id in range(len(self.models))
         ]
         self._init_tokenizer_inds_mappings(encoders_inputs=encoders_inputs)
-        
+
+        num_models = len(self.models)
+        stop_gen_mask = np.zeros((num_beams, num_models))  # num_beams x num_models
         stop_token_ids: set[int] = self.agg_tokenizer.eos_token_id_set
-        next_agg_token_id = None
         beam_sequences = [[] for _ in range(num_beams)]
         beam_is_eos = [False for _ in range(num_beams)]
         beam_input_texts = ["" for _ in range(num_beams)]
@@ -237,12 +235,13 @@ class AggregatedGenerator:
                     beam_sequences,
                     beam_scores,
                     beam_is_eos,
+                    stop_gen_mask,
                     is_first=(generated_count == 0),
                     device=device,
                     num_beams=num_beams,
                     beam_top_k=beam_top_k,
                 )
-                eos_criteria = all(beam_is_eos)
+                eos_criteria = all(beam_is_eos) or (stop_gen_mask.sum() == num_beams * num_models)
                 
             else:
                 next_agg_token_id, decoder_output_text, decoder_output_ids = self._generate_agg_next_top_k_p(
@@ -292,11 +291,12 @@ class AggregatedGenerator:
     @torch.no_grad()
     def _generate_agg_next_beams(
         self, 
-        encoders_inputs: list[list[int]] | list[torch.Tensor], 
+        encoders_inputs: list[dict],
         beam_input_texts: list[str], 
         beam_sequences: list[list[int]],
         beam_scores: list[float],
         beam_is_eos: list[bool],
+        stop_gen_mask: np.ndarray,
         is_first: bool,
         device: str = "cuda",
         num_beams: int = 1,
@@ -304,12 +304,18 @@ class AggregatedGenerator:
     ):
         all_candidates = []
         for beam_idx in range(num_beams):
-            if beam_is_eos[beam_idx]:
-                continue
-            
+            is_eos_of_beam = (stop_gen_mask[beam_idx, :].sum() == len(self.models))
+            if is_eos_of_beam:
+                # beam is full already => just use it as candidate
+                sequence = beam_sequences[beam_idx]
+                score = beam_scores[beam_idx]
+                all_candidates.append((sequence, score, beam_idx))
+
             agg_probs = np.zeros(len(self.agg_tokenizer.vocab))
-            
             for model_id, model in enumerate(self.models):
+                if stop_gen_mask[beam_idx][model_id]:
+                    continue
+
                 decoder_input_text_local = f"{self.decoder_prompts[model_id]} {beam_input_texts[beam_idx]}" if beam_input_texts[beam_idx] else self.decoder_prompts[model_id]
                 decoder_input_ids = self.agg_tokenizer.tokenize_single(
                     tokenizer_id=model_id, 
@@ -318,7 +324,7 @@ class AggregatedGenerator:
                     add_special_tokens=False,
                 ).to(device)['input_ids'] if decoder_input_text_local is not None else None
     
-                next_token_logits_tuple = model.generate(
+                next_token_output = model.generate(
                     **encoders_inputs[model_id], 
                     decoder_input_ids=decoder_input_ids, 
                     num_beams=1,
@@ -326,8 +332,13 @@ class AggregatedGenerator:
                     output_logits=True,
                     return_dict_in_generate=True,
                     **self.gen_kwargs[model_id]
-                )['logits']  
-    
+                )
+                next_token_logits_tuple = next_token_output['logits']
+                single_model_next_token_id = next_token_output['sequences'][0, -1].cpu().item()  # take last token of first sequence
+                stop_gen_mask[beam_idx][model_id] = (
+                    single_model_next_token_id == self.agg_tokenizer.eos_tokens_ids[model_id]
+                )
+
                 next_token_logits = torch.concat(next_token_logits_tuple, dim=0)[0]
                 logits_filtered = next_token_logits[
                     self._valid_tokenizes_inds[model_id]
@@ -337,13 +348,21 @@ class AggregatedGenerator:
 
             # Normalize agg_probs
             agg_probs = agg_probs / agg_probs.sum()
+            is_eos_of_beam_new = (stop_gen_mask[beam_idx, :].sum() == len(self.models))
 
             # Collect all candidate tokens and their scores
-            candidate_ids = np.arange(len(agg_probs))
-            for candidate_id in candidate_ids:
-                new_sequence = beam_sequences[beam_idx] + [candidate_id]
-                new_score = beam_scores[beam_idx] + np.log(agg_probs[candidate_id])
-                all_candidates.append((new_sequence, new_score))
+            if is_eos_of_beam_new:
+                eos_id = list(self.agg_tokenizer.eos_token_id_set)[0]  # take any of possible eos ids
+                new_sequence = beam_sequences[beam_idx] + [eos_id]
+                new_score = beam_scores[beam_idx]
+                all_candidates.append((new_sequence, new_score, beam_idx))
+
+            else:
+                candidate_ids = np.arange(len(agg_probs))
+                for candidate_id in candidate_ids:
+                    new_sequence = beam_sequences[beam_idx] + [candidate_id]
+                    new_score = beam_scores[beam_idx] + np.log(agg_probs[candidate_id])
+                    all_candidates.append((new_sequence, new_score, beam_idx))
             
             if is_first:
                 # break, because first token should be [:top_k] from one-beam scores
@@ -354,7 +373,7 @@ class AggregatedGenerator:
         all_candidates.sort(key=lambda x: x[1], reverse=True)
         top_k_candidates = all_candidates[:beam_top_k]
 
-        top_k_scores = np.array([score for seq, score in top_k_candidates])
+        top_k_scores = np.array([score for _, score, _ in top_k_candidates])
         top_k_scores_normalized = top_k_scores / top_k_scores.sum()
 
         ranked_candidate_inds_unsorted = np.random.choice(
@@ -367,11 +386,18 @@ class AggregatedGenerator:
 
         beam_sequences = []
         beam_scores = []
+        beam_old_inds = []
         for ranked_candidate_ind in ranked_candidate_inds_sorted:
             beam_sequences.append(top_k_candidates[ranked_candidate_ind][0])
             beam_scores.append(top_k_candidates[ranked_candidate_ind][1])
-            
-                
+            beam_old_inds.append(top_k_candidates[ranked_candidate_ind][2])
+
+        stop_gen_mask = stop_gen_mask[beam_old_inds, :]
+
+        print([len(beam_sequences[i]) for i in range(num_beams)])
+        print("Old beams inds:", beam_old_inds)
+        print("Mask:\n", stop_gen_mask)
+
         # Update beam_input_texts for the next step
         beam_input_texts = [self.agg_tokenizer.decode(seq, skip_special_tokens=True) for seq in beam_sequences]
         beam_is_eos = [seq[-1] in self.agg_tokenizer.eos_token_id_set for seq in beam_sequences]
@@ -387,7 +413,6 @@ class AggregatedGenerator:
         print()
 
         return decoder_output_ids[-1], decoder_output_text, decoder_output_ids, beam_sequences, beam_input_texts, beam_scores, beam_is_eos
-
 
     def generate_all_single(self, encoder_input_text: str, device: str = "cuda"):
         decoders_output_texts = [
