@@ -4,31 +4,36 @@ import numpy as np
 import torch.nn.functional as F
 
 from .tokenize import AggregatedTokenizer
+from .evaluate import SimilarityChecker
 
-
-class AggregatedGenerator:
+class EnsembleGenerator:
     def __init__(
-        self, 
-        models: list, 
-        agg_tokenizer: AggregatedTokenizer, 
-        generation_kwargs: list[dict], 
+        self,
+        models: list,
+        similarity_checker: SimilarityChecker, 
+        agg_tokenizer: AggregatedTokenizer,
+        generation_kwargs: list[dict],
         decoder_prompts: list[str | None],
-        encoder_prompts: list[str | None]
+        encoder_prompts: list[str | None],
     ):
         self.agg_tokenizer = agg_tokenizer
+        self.similarity_checker = similarity_checker
         self.models = models
         self.gen_kwargs: list[dict] = generation_kwargs
         self.decoder_prompts: list[str | None] = decoder_prompts
         self.encoder_prompts: list[str | None] = encoder_prompts
-        
-        self.normalization_coef = 1 / len(self.models)  
+        self.num_models = len(self.models)
 
+        self.EMPTY_CANDIDATE_IND = -1
+        
     def _text_to_inds(self, model_id, text: str, return_tensors="pt"):
-        return self.agg_tokenizer.tokenizers[model_id](text, return_tensors=return_tensors).input_ids
+        return self.agg_tokenizer.tokenizers[model_id](
+            text, return_tensors=return_tensors
+        ).input_ids
 
     def _init_tokenizer_inds_mappings(
         self,
-        encoders_inputs,
+        dummy_encoders_inputs,
     ):
         n_models = len(self.models)
         valid_tokenizes_inds = [[] for _ in range(n_models)]
@@ -37,385 +42,414 @@ class AggregatedGenerator:
 
         for model_id in range(len(self.models)):
             next_token_logits_tuple = self.models[model_id].generate(
-                **encoders_inputs[model_id], 
+                **dummy_encoders_inputs[model_id],
                 max_new_tokens=1,
                 num_beams=1,
                 output_logits=True,
                 return_dict_in_generate=True,
-                **self.gen_kwargs[model_id]
-            )['logits']  
-            next_token_logits = torch.concat(next_token_logits_tuple, dim=0)[0].cpu().numpy()
-            
+                **self.gen_kwargs[model_id],
+            )["logits"]
+            next_token_logits = (
+                torch.concat(next_token_logits_tuple, dim=0)[0].cpu().numpy()
+            )
+
             for token_ind in range(next_token_logits.shape[0]):
-                token_str = self.agg_tokenizer.reverse_vocabs[model_id].get(token_ind)  # token in original tokenizer
+                token_str = self.agg_tokenizer.reverse_vocabs[model_id].get(
+                    token_ind
+                )  # token in original tokenizer
                 if token_str is not None:
-                    agg_token_id = self.agg_tokenizer.vocab[token_str]   
+                    agg_token_id = self.agg_tokenizer.vocab[token_str]
                     agg_tokenizer_inds[model_id].append(agg_token_id)
                     valid_tokenizes_inds[model_id].append(token_ind)
 
-            for valid_token_ind, agg_token_id in enumerate(agg_tokenizer_inds[model_id]):
-                valid_to_agg_inds[model_id].append(agg_token_id)  # valid_token_ind --> agg_token_id
-            
+            for valid_token_ind, agg_token_id in enumerate(
+                agg_tokenizer_inds[model_id]
+            ):
+                valid_to_agg_inds[model_id].append(
+                    agg_token_id
+                )  # valid_token_ind --> agg_token_id
+
         self._valid_tokenizes_inds = valid_tokenizes_inds
         self._agg_tokenizer_inds = agg_tokenizer_inds
         self._valid_to_agg_inds = valid_to_agg_inds
 
-        
-    
+
     @torch.no_grad()
-    def _generate_agg_next_top_k_p(
-        self, 
-        encoders_inputs: list[dict],
-        decoder_input_text: list[int] | torch.Tensor | None,
-        agg_decoder_input_ids: list[int] | torch.Tensor | None,
-        device: str = "cuda",
-        top_k: int | None = None,
-        top_p: float | None = None,
-    ):
-        assert top_k is None or top_p is None , "top_k, top_p cannot be chosen at the same time"
+    def _get_encoder_hidden_states(self, model_id: int, encoder_inputs: list[dict]):
+        try:
+            encoder_output_vectors = (
+                self.models[model_id]
+                .base_model.encoder(**encoder_inputs[model_id], return_dict=True)
+                .last_hidden_state
+            )
+        except AttributeError:
+            encoder_output_vectors = (
+                self.models[model_id]
+                .base_model.text_encoder(**encoder_inputs[model_id], return_dict=True)
+                .last_hidden_state
+            )
+        return encoder_output_vectors
 
-        # for each model
-        agg_probs = np.zeros(len(self.agg_tokenizer.vocab))
-        
-        for model_id, model in enumerate(self.models):
-            decoder_input_text_local = f"{self.decoder_prompts[model_id]} {decoder_input_text}" if decoder_input_text else self.decoder_prompts[model_id]
-            start = time.time()
-            decoder_input_ids = self.agg_tokenizer.tokenize_single(
-                tokenizer_id=model_id, 
-                input_text=decoder_input_text_local,
-                is_decoder_input=True,
-                add_special_tokens=False,
-            ).to(device)['input_ids'] if decoder_input_text_local is not None else None
-            total = time.time() - start 
-            # print(f"{model_id=} decoding time (s): {total}")
-            
-            start = time.time()
-            next_token_logits_tuple = model.generate(
-                **encoders_inputs[model_id], 
-                decoder_input_ids=decoder_input_ids, 
-                max_new_tokens=1,
-                num_beams=1,
-                output_logits=True,
-                return_dict_in_generate=True,
-                **self.gen_kwargs[model_id]
-            )['logits']  
-            total = time.time() - start 
-            # print(f"{model_id=} generate time (s): {total}")
-         
-            
-            start = time.time()
-            next_token_logits = torch.concat(next_token_logits_tuple, dim=0)[0]
-            logits_filtered = next_token_logits[
-                self._valid_tokenizes_inds[model_id]
-            ]
-            scores_filtered = F.softmax(logits_filtered, dim=-1).cpu().numpy()
-            agg_probs[self._valid_to_agg_inds[model_id]] += self.normalization_coef * scores_filtered
-            
-            total = time.time() - start 
-            # print(f"{model_id=} agg_probs compute time (s): {total}")
+    def _init_eos_not_eos_ids(self):
+        self.eos_ids = list(self.agg_tokenizer.eos_token_id_set)
+        self.not_eos_ids = list(set(range(len(self.agg_tokenizer.vocab))) - set(self.eos_ids))    
 
-        # print("sum probs =", agg_probs.sum())
-        # make agg_probs sum up to 1. due to not existent tokens before 
-        agg_probs = agg_probs / agg_probs.sum()
-                
-        # top-p, top-k or beam search on agg_token_probas
-        if top_k is not None:
-            inds = np.argsort(-agg_probs)[:top_k]
-            next_agg_token_id = np.random.choice(inds, p = agg_probs[inds] / agg_probs[inds].sum())
-
-        elif top_p is not None:
-            inds = np.argsort(-agg_probs)
-            while agg_probs[inds].sum() > top_p and len(inds) > 1:
-                inds = inds[:-1]
-            next_agg_token_id = np.random.choice(inds, p = agg_probs[inds] / agg_probs[inds].sum())
-        
-        else:
-            next_agg_token_id = np.random.choice(np.arange(agg_probs.shape[0]), p=agg_probs) 
-
-        decoder_output_ids = agg_decoder_input_ids + [next_agg_token_id] if agg_decoder_input_ids is not None else [next_agg_token_id] 
-        decoder_output_text = self.agg_tokenizer.decode(decoder_output_ids, skip_special_tokens=True)
-        return next_agg_token_id, decoder_output_text, decoder_output_ids
+    @staticmethod
+    def _repeat_first_dim(t, n_repeat):
+        other_dims = [1] * (t.ndim - 1)
+        return t.repeat(n_repeat, *other_dims)
     
-    
-    @torch.no_grad()
-    def _generate_next(
-        self, 
-        model_id: int,
-        encoder_input_text: str, 
-        decoder_input_text: str | None,
-        device: str = "cuda",
-        max_new_tokens: int = 1,
-    ):
-        encoder_input_text = f"{self.encoder_prompts[model_id]} {encoder_input_text}" if self.encoder_prompts[model_id] is not None else encoder_input_text
-        encoder_inputs = self.agg_tokenizer.tokenize_single(
-            tokenizer_id=model_id, 
-            input_text=encoder_input_text,
-            add_special_tokens=True
-        ).to(device)
-
-        if decoder_input_text:
-            decoder_input_ids = self.agg_tokenizer.tokenize_single(
-                tokenizer_id=model_id, 
-                input_text=decoder_input_text,
-                is_decoder_input=True,
-                add_special_tokens=False,
-            ).to(device)['input_ids'] 
-        else: 
-            decoder_input_ids = None
-        print(decoder_input_text, decoder_input_ids)
-
-        print(encoder_inputs)
-        print(self.gen_kwargs[model_id])
-               
-        next_token_logits_tuple = self.models[model_id].generate(
-            **encoder_inputs, 
-            decoder_input_ids=decoder_input_ids,
-            max_new_tokens=max_new_tokens,
-            num_beams=1,
-            output_logits=True,
-            return_dict_in_generate=True,
-            **self.gen_kwargs[model_id]
-        )['logits']  
-        print(next_token_logits_tuple)
-        print(next_token_logits_tuple[0].shape)
-        
-        next_token_logits = torch.concat(next_token_logits_tuple, dim=0)
-        next_tokens_ids = torch.max(next_token_logits, dim=-1).indices.cpu().tolist()
-        decoder_input_ids = decoder_input_ids.cpu().tolist()[0] if decoder_input_ids is not None else []
-        decoder_output_ids = decoder_input_ids + next_tokens_ids
-        decoder_output_text = self.agg_tokenizer.tokenizers[model_id].decode(
-            decoder_output_ids, skip_special_tokens=True
-        )
-        return next_tokens_ids, decoder_output_text, decoder_output_ids
-     
-            
-    def generate_agg(
-        self, 
-        encoder_input_text: str, 
-        max_new_tokens=256, 
+    def ensemble_generate(
+        self,
+        encoder_input_text: str,
+        max_new_tokens=256,
         device="cuda",
-        top_k: int | None = None,
-        top_p: float | None = None,
         num_beams: int = 1,
-        beam_top_k: int | None = None
+        beam_top_k: int | None = None,
+        verbose: bool = False,
     ):
+        assert num_beams >= 1
+        
         if beam_top_k is None:
             beam_top_k = num_beams
-        
+
+
+        # Encoder outputs precomputation
         encoder_input_text = encoder_input_text.replace("\n", "")
-        encoders_inputs: list[torch.Tensor] = [
+        encoders_inputs: list[dict] = [
             self.agg_tokenizer.tokenize_single(
-                tokenizer_id=model_id, 
-                input_text=f"{self.encoder_prompts[model_id]} {encoder_input_text}" if self.encoder_prompts[model_id] is not None else encoder_input_text,
-                add_special_tokens=True
+                tokenizer_id=model_id,
+                input_text=(
+                    f"{self.encoder_prompts[model_id]} {encoder_input_text}"
+                    if self.encoder_prompts[model_id] is not None
+                    else encoder_input_text
+                ),
+                add_special_tokens=True,
             ).to(device)
             for model_id in range(len(self.models))
         ]
-        self._init_tokenizer_inds_mappings(encoders_inputs=encoders_inputs)
 
-        num_models = len(self.models)
-        stop_gen_mask = np.zeros((num_beams, num_models))  # num_beams x num_models
+        encoders_last_hidden_states = [
+            self._get_encoder_hidden_states(model_id, encoders_inputs)
+            for model_id in range(len(self.models))
+        ]
+
+        self._init_eos_not_eos_ids()
+        self._init_tokenizer_inds_mappings(dummy_encoders_inputs=encoders_inputs)
+
+        stop_gen_mask = np.zeros((num_beams, self.num_models))  # num_beams x num_models
         stop_token_ids: set[int] = self.agg_tokenizer.eos_token_id_set
         beam_sequences = [[] for _ in range(num_beams)]
-        beam_is_eos = [False for _ in range(num_beams)]
         beam_input_texts = ["" for _ in range(num_beams)]
+        beam_is_eos = [False for _ in range(num_beams)]
         beam_scores = [0] * num_beams
         decoder_output_ids = []
         decoder_output_text = ""
         generated_count = 0
         eos_criteria = False
-        
+
         while not eos_criteria and generated_count + 1 < max_new_tokens:
             decoder_input_text = decoder_output_text
             decoder_input_ids = decoder_output_ids
-            if num_beams > 1:
-                next_agg_token_id, decoder_output_text, decoder_output_ids, beam_sequences, beam_input_texts, beam_scores, beam_is_eos = self._generate_agg_next_beams(
-                    encoders_inputs,
-                    beam_input_texts,
-                    beam_sequences,
-                    beam_scores,
-                    beam_is_eos,
-                    stop_gen_mask,
-                    is_first=(generated_count == 0),
-                    device=device,
-                    num_beams=num_beams,
-                    beam_top_k=beam_top_k,
-                )
-                eos_criteria = all(beam_is_eos) or (stop_gen_mask.sum() == num_beams * num_models)
-                
-            else:
-                next_agg_token_id, decoder_output_text, decoder_output_ids = self._generate_agg_next_top_k_p(
-                    encoders_inputs,
-                    decoder_input_text,
-                    device=device,
-                    top_k=top_k,
-                    top_p=top_p,
-                    agg_decoder_input_ids=decoder_input_ids
-                )
-                eos_criteria = (next_agg_token_id in stop_token_ids)
-                print(self.agg_tokenizer.reverse_vocab[next_agg_token_id].replace("▁", " "), end="")
-
-            generated_count += 1 
-        return decoder_output_text, decoder_output_ids
-
-    @torch.no_grad()
-    def generate_single(self, model_id: int, encoder_input_text: str, device: str = "cuda"):
-        encoder_input_text = encoder_input_text.replace("\n", "")
-        encoder_input_text = f"{self.encoder_prompts[model_id]} {encoder_input_text}" if self.encoder_prompts[model_id] is not None else encoder_input_text
-        encoder_inputs = self.agg_tokenizer.tokenize_single(
-            tokenizer_id=model_id, 
-            input_text=encoder_input_text, 
-            add_special_tokens=True
-        ).to(device)
-        decoder_input_ids = self.agg_tokenizer.tokenize_single(
-            tokenizer_id=model_id, 
-            input_text=self.decoder_prompts[model_id],
-            is_decoder_input=True
-        ).to(device)['input_ids'] if self.decoder_prompts[model_id] is not None else None
-
-        tok_preds = self.models[model_id].generate(
-            **encoder_inputs, 
-            decoder_input_ids=decoder_input_ids, 
-            num_beams=1,
-            max_new_tokens=256,
-            output_logits=True,
-            return_dict_in_generate=True,
-            **self.gen_kwargs[model_id],
-        )['sequences']
-        decoder_output_text = self.agg_tokenizer.tokenizers[model_id].decode(
-            tok_preds.detach().cpu()[0], skip_special_tokens=True
-        )
-        return decoder_output_text
-    
-    
-    @torch.no_grad()
-    def _generate_agg_next_beams(
-        self, 
-        encoders_inputs: list[dict],
-        beam_input_texts: list[str], 
-        beam_sequences: list[list[int]],
-        beam_scores: list[float],
-        beam_is_eos: list[bool],
-        stop_gen_mask: np.ndarray,
-        is_first: bool,
-        device: str = "cuda",
-        num_beams: int = 1,
-        beam_top_k: int | None = 1,
-    ):
-        all_candidates = []
-        for beam_idx in range(num_beams):
-            is_eos_of_beam = (stop_gen_mask[beam_idx, :].sum() == len(self.models))
-            if is_eos_of_beam:
-                # beam is full already => just use it as candidate
-                sequence = beam_sequences[beam_idx]
-                score = beam_scores[beam_idx]
-                all_candidates.append((sequence, score, beam_idx))
-
-            agg_probs = np.zeros(len(self.agg_tokenizer.vocab))
-            for model_id, model in enumerate(self.models):
-                if stop_gen_mask[beam_idx][model_id]:
-                    continue
-
-                decoder_input_text_local = f"{self.decoder_prompts[model_id]} {beam_input_texts[beam_idx]}" if beam_input_texts[beam_idx] else self.decoder_prompts[model_id]
-                decoder_input_ids = self.agg_tokenizer.tokenize_single(
-                    tokenizer_id=model_id, 
-                    input_text=decoder_input_text_local,
-                    is_decoder_input=True,
-                    add_special_tokens=False,
-                ).to(device)['input_ids'] if decoder_input_text_local is not None else None
-    
-                next_token_output = model.generate(
-                    **encoders_inputs[model_id], 
-                    decoder_input_ids=decoder_input_ids, 
-                    num_beams=1,
-                    max_new_tokens=1,
-                    output_logits=True,
-                    return_dict_in_generate=True,
-                    **self.gen_kwargs[model_id]
-                )
-                next_token_logits_tuple = next_token_output['logits']
-                single_model_next_token_id = next_token_output['sequences'][0, -1].cpu().item()  # take last token of first sequence
-                stop_gen_mask[beam_idx][model_id] = (
-                    single_model_next_token_id == self.agg_tokenizer.eos_tokens_ids[model_id]
-                )
-
-                next_token_logits = torch.concat(next_token_logits_tuple, dim=0)[0]
-                logits_filtered = next_token_logits[
-                    self._valid_tokenizes_inds[model_id]
-                ]
-                scores_filtered = F.softmax(logits_filtered, dim=-1).cpu().numpy()
-                agg_probs[self._valid_to_agg_inds[model_id]] += self.normalization_coef * scores_filtered
-
-            # Normalize agg_probs
-            agg_probs = agg_probs / agg_probs.sum()
-            is_eos_of_beam_new = (stop_gen_mask[beam_idx, :].sum() == len(self.models))
-
-            # Collect all candidate tokens and their scores
-            if is_eos_of_beam_new:
-                eos_id = list(self.agg_tokenizer.eos_token_id_set)[0]  # take any of possible eos ids
-                new_sequence = beam_sequences[beam_idx] + [eos_id]
-                new_score = beam_scores[beam_idx]
-                all_candidates.append((new_sequence, new_score, beam_idx))
-
-            else:
-                candidate_ids = np.arange(len(agg_probs))
-                for candidate_id in candidate_ids:
-                    new_sequence = beam_sequences[beam_idx] + [candidate_id]
-                    new_score = beam_scores[beam_idx] + np.log(agg_probs[candidate_id])
-                    all_candidates.append((new_sequence, new_score, beam_idx))
-            
-            if is_first:
-                # break, because first token should be [:top_k] from one-beam scores
-                break
-        
-
-        # Select the top num_beams sequences
-        all_candidates.sort(key=lambda x: x[1], reverse=True)
-        top_k_candidates = all_candidates[:beam_top_k]
-
-        top_k_scores = np.array([score for _, score, _ in top_k_candidates])
-        top_k_scores_normalized = top_k_scores / top_k_scores.sum()
-
-        ranked_candidate_inds_unsorted = np.random.choice(
-            range(beam_top_k), 
-            size=num_beams, 
-            p=top_k_scores_normalized, 
-            replace=False
-        )
-        ranked_candidate_inds_sorted = sorted(ranked_candidate_inds_unsorted)
-
-        beam_sequences = []
-        beam_scores = []
-        beam_old_inds = []
-        for ranked_candidate_ind in ranked_candidate_inds_sorted:
-            beam_sequences.append(top_k_candidates[ranked_candidate_ind][0])
-            beam_scores.append(top_k_candidates[ranked_candidate_ind][1])
-            beam_old_inds.append(top_k_candidates[ranked_candidate_ind][2])
-
-        stop_gen_mask = stop_gen_mask[beam_old_inds, :]
-
-        print([len(beam_sequences[i]) for i in range(num_beams)])
-        print("Old beams inds:", beam_old_inds)
-        print("Mask:\n", stop_gen_mask)
-
-        # Update beam_input_texts for the next step
-        beam_input_texts = [self.agg_tokenizer.decode(seq, skip_special_tokens=True) for seq in beam_sequences]
-        beam_is_eos = [seq[-1] in self.agg_tokenizer.eos_token_id_set for seq in beam_sequences]
+            (
+                beam_sequences,
+                beam_input_texts,
+                beam_scores,
+                beam_is_eos,
+                stop_gen_mask,
+            ) = self._generate_agg_next_beams(
+                encoders_last_hidden_states,
+                beam_input_texts,
+                beam_sequences,
+                beam_scores,
+                stop_gen_mask,
+                beam_is_eos,
+                device=device,
+                num_beams=num_beams,
+                beam_top_k=beam_top_k,
+                verbose=verbose,
+            )
+            eos_criteria = all(beam_is_eos) or (
+                stop_gen_mask.sum() == num_beams * self.num_models
+            )
+            generated_count += 1
         
         # Return the best beam
         best_beam_idx = np.argmax(beam_scores)
         decoder_output_ids = beam_sequences[best_beam_idx]
-        decoder_output_text = self.agg_tokenizer.decode(decoder_output_ids, skip_special_tokens=True)
+        decoder_output_text = self.agg_tokenizer.decode(
+            decoder_output_ids, 
+            skip_special_tokens=True
+        )
+        del encoders_last_hidden_states
+        return decoder_output_text
 
-        print()
-        for beam_input_text, beam_score in zip(beam_input_texts, beam_scores):
-            print(f"score = {beam_score: 0.5f} - {beam_input_text}")
-        print()
+    
+    @torch.no_grad()
+    def _generate_agg_next_beams(
+        self,
+        encoders_output_vectors: list[torch.Tensor],
+        beam_input_texts: list[str],
+        beam_sequences: list[list[int]],
+        beam_scores: list[float],
+        stop_gen_mask: np.ndarray,
+        beam_is_eos: list[bool],
+        device: str = "cuda",
+        num_beams: int = 1,
+        beam_top_k: int | None = 1,
+        verbose: bool = False,
+    ):
+        beams_input_texts_set = set()
+        other_candidates_list = []
+        running_beams = []
 
-        return decoder_output_ids[-1], decoder_output_text, decoder_output_ids, beam_sequences, beam_input_texts, beam_scores, beam_is_eos
+        ### Check for running/stopped beams
+        for beam_idx in range(num_beams):            
+            if beam_input_texts[beam_idx] in beams_input_texts_set:
+                # beam has duplicate => skip it
+                continue
+            elif beam_is_eos[beam_idx]:
+                # beam is full already => just use it as candidate
+                sequence = beam_sequences[beam_idx]
+                score = beam_scores[beam_idx]
+                local_candidates = np.full((1, 3), fill_value=np.nan)  # just one not changed candidate
+                # candidate_id, score, beam_idx
+                local_candidates[-1, :] = [self.EMPTY_CANDIDATE_IND, beam_scores[beam_idx], beam_idx]   
+                local_candidates = local_candidates[~np.isnan(local_candidates).any(axis=1)]
+                other_candidates_list.append(local_candidates)
+                continue
+            
+            beams_input_texts_set.add(beam_input_texts[beam_idx])
+            running_beams.append(beam_idx)
 
-    def generate_all_single(self, encoder_input_text: str, device: str = "cuda"):
+        
+        beam_bs = len(running_beams)
+        next_probs = np.zeros((num_beams, len(self.agg_tokenizer.vocab)))
+
+        for model_id, model in enumerate(self.models):
+
+            ### Tokenization of decoder input
+            decoder_input_texts_local = [
+                f"{self.decoder_prompts[model_id]} {beam_input_texts[beam_idx]}"
+                if beam_input_texts[beam_idx]
+                else self.decoder_prompts[model_id] 
+                for beam_idx in running_beams
+            ]
+                        
+            decoder_inputs = self.agg_tokenizer.tokenize_single(
+                model_id, 
+                decoder_input_texts_local, 
+                is_decoder_input=True, 
+                add_special_tokens=False,
+                padding=True,
+                pad_to_multiple_of=1,
+            ).to(device)
+
+            ### Generating next token logits
+            outputs = self.models[model_id](
+                input_ids=None,
+                decoder_input_ids=decoder_inputs.input_ids,
+                decoder_attention_mask=decoder_inputs.attention_mask,
+                encoder_outputs=(self._repeat_first_dim(encoders_output_vectors[model_id], beam_bs),),
+                return_dict=True,
+                **self.gen_kwargs[model_id],
+            )
+
+            ### Processing predicted probabilities
+            beam_next_token_logits = outputs.logits[:, -1, :]
+            beam_next_token_ids = torch.argmax(beam_next_token_logits, dim=-1).cpu() 
+            
+            stop_gen_mask[running_beams, model_id] = (
+                beam_next_token_ids == self.agg_tokenizer.eos_tokens_ids[model_id]
+            )
+
+            logits_filtered = beam_next_token_logits[:, self._valid_tokenizes_inds[model_id]]
+            
+            scores_filtered = F.softmax(logits_filtered, dim=-1).cpu().numpy()
+            next_probs[np.ix_(running_beams, self._valid_to_agg_inds[model_id])] += (
+                scores_filtered
+            )
+
+        ### Adding candidates for beams
+        next_probs = next_probs / next_probs.sum(axis=1, keepdims=True)
+        next_probs_clipped = np.clip(next_probs, 0.0, 1.0)
+        next_log_probs = np.log(next_probs_clipped)
+        
+        # Here condition of eos can be defined: [... == self.num_models] [... > self.num_models / 2]
+        beam_is_eos_new = stop_gen_mask.sum(axis=1) == self.num_models  
+
+        beam_candidates = np.full((len(running_beams), len(self.agg_tokenizer.vocab), 3), fill_value=np.nan)
+        beam_candidates[:, :, 0] = range(len(self.agg_tokenizer.vocab))
+        for i, beam_idx in enumerate(running_beams):
+            beam_candidates[i, :, 2] = beam_idx
+            beam_candidates[i, :, 1] = beam_scores[beam_idx] + next_log_probs[beam_idx, :]
+            if not beam_is_eos_new[beam_idx]:
+                beam_candidates[i, self.eos_ids, 1] = np.nan
+        
+        ### Updating beams
+        all_candidates = np.vstack([np.vstack(beam_candidates), *other_candidates_list])
+        all_candidates = all_candidates[~np.isnan(all_candidates).any(axis=1)]
+
+        if all_candidates.shape[0] > beam_top_k:
+            top_k_candidates = all_candidates[np.argpartition(-all_candidates[:, 1], beam_top_k, axis=0)[:beam_top_k], :]
+        else:
+            top_k_candidates = all_candidates
+        
+        num_top_k_candidates = top_k_candidates.shape[0]
+
+        top_k_scores = top_k_candidates[:, 1]
+        top_k_scores_normalized = top_k_scores / top_k_scores.sum()
+        
+        if beam_top_k > num_beams:
+            ranked_candidate_inds = np.random.choice(
+                range(min(num_top_k_candidates, beam_top_k)), 
+                size=min(num_top_k_candidates, num_beams), 
+                p=top_k_scores_normalized, 
+                replace=False
+            )
+        else:
+            ranked_candidate_inds = range(min(num_top_k_candidates, num_beams))
+
+        beam_sequences_old = beam_sequences
+        beam_sequences = []
+        beam_scores = top_k_candidates[ranked_candidate_inds, 1].tolist()
+        beam_old_inds = top_k_candidates[ranked_candidate_inds, 2].astype(int).tolist()
+        for ranked_candidate_ind in ranked_candidate_inds:
+            candidate_id = int(top_k_candidates[ranked_candidate_ind][0])
+            candidate_beam_idx = beam_old_inds[ranked_candidate_ind]
+            if candidate_id != self.EMPTY_CANDIDATE_IND:
+                new_sequence = beam_sequences_old[candidate_beam_idx] + [candidate_id]
+            else:
+                new_sequence = beam_sequences_old[candidate_beam_idx]
+            beam_sequences.append(new_sequence)
+
+        stop_gen_mask = stop_gen_mask[beam_old_inds, :]
+        beam_input_texts = [
+            self.agg_tokenizer.decode(seq, skip_special_tokens=True)
+            for seq in beam_sequences
+        ]
+        beam_is_eos = [
+            seq[-1] in self.agg_tokenizer.eos_token_id_set for seq in beam_sequences
+        ]
+        if verbose:
+            print()
+            for beam_input_text, beam_score in zip(beam_input_texts, beam_scores):
+                print(f"score = {beam_score: 0.5f} - {beam_input_text}")
+            print()
+        
+        del logits_filtered, outputs, beam_next_token_logits
+        return (
+            beam_sequences,
+            beam_input_texts,
+            beam_scores,
+            beam_is_eos,
+            stop_gen_mask,
+        )
+
+    @torch.no_grad()
+    def generate_single(
+        self, 
+        model_id: int, 
+        encoder_input_text: str, 
+        device: str = "cuda", 
+        num_beams: int = 5, 
+        max_new_tokens: int = 256,  
+        **kwargs
+    ):
+        encoder_input_text = encoder_input_text.replace("\n", "")
+        encoder_input_text = (
+            f"{self.encoder_prompts[model_id]} {encoder_input_text}"
+            if self.encoder_prompts[model_id] is not None
+            else encoder_input_text
+        )
+        encoder_inputs = self.agg_tokenizer.tokenize_single(
+            tokenizer_id=model_id,
+            input_text=encoder_input_text,
+            add_special_tokens=True,
+        ).to(device)
+        decoder_input_ids = (
+            self.agg_tokenizer.tokenize_single(
+                tokenizer_id=model_id,
+                input_text=self.decoder_prompts[model_id],
+                is_decoder_input=True,
+            ).to(device)["input_ids"]
+            if self.decoder_prompts[model_id] is not None
+            else None
+        )
+        tok_preds = self.models[model_id].generate(
+            **encoder_inputs,
+            decoder_input_ids=decoder_input_ids,
+            num_beams=5,
+            max_new_tokens=max_new_tokens,
+            **self.gen_kwargs[model_id],
+            **kwargs,
+        )
+        if isinstance(tok_preds, torch.Tensor):
+            decoder_output_text = self.agg_tokenizer.tokenizers[model_id].decode(
+                tok_preds.cpu()[0], skip_special_tokens=True
+            )
+        else:
+            decoder_output_text = self.agg_tokenizer.tokenizers[model_id].decode(
+                tok_preds.sequences.cpu()[0], skip_special_tokens=True
+            )
+
+        
+        return decoder_output_text
+
+    def generate_all_single(
+        self, 
+        encoder_input_text: str, 
+        device: str = "cuda",
+        num_beams: int = 5, 
+        max_new_tokens: int = 256,  
+        **kwargs
+    ):
         decoders_output_texts = [
-            self.generate_single(model_id=model_id, encoder_input_text=encoder_input_text, device=device) for model_id in range(len(self.models))
+            self.generate_single(
+                model_id=model_id, 
+                encoder_input_text=encoder_input_text, 
+                device=device,
+                num_beams=num_beams,
+                max_new_tokens=max_new_tokens,
+                **kwargs
+            )
+            for model_id in range(self.num_models)
         ]
         return decoders_output_texts
+
+    def translate(
+        self, 
+        src_text: str, 
+        device: str = "cuda",
+        ensemble_num_beams: int = 3, 
+        instance_num_beams: int = 5,
+        max_new_tokens: int = 256,
+        verbose: bool = False,
+        **kwargs
+    ):
+        response = dict()
+        if verbose:
+            print("Generating ensemble translation...")
+        
+        response['ensemble_translation'] = self.ensemble_generate(
+            encoder_input_text=src_text,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            num_beams=ensemble_num_beams,
+            verbose=verbose,
+        )
+        if verbose:
+            print("Generating instance translations...")
+
+        response['instance_translations'] = self.generate_all_single(
+            encoder_input_text=src_text, 
+            device=device,
+            num_beams=instance_num_beams, 
+            max_new_tokens=max_new_tokens,  
+            **kwargs
+        )
+
+        response["similarity"] = self.similarity_checker.check_similarity(texts=response['instance_translations'])
+        return response
+        
+

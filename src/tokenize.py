@@ -15,7 +15,7 @@ class AggregatedTokenizer:
         self.reverse_vocabs = [{v: k for k, v in vocab.items()} for vocab in self.vocabs]  #  id --> str
         
         self._agg_tokenizer = self._init_agg_tokenizer()
-        self.vocab = self._agg_tokenizer.get_vocab() # str --> id
+        self.vocab = self._agg_tokenizer.get_vocab()  # str --> id
         self.reverse_vocab = {v: k for k, v in self.vocab.items()}
 
         self.unk_tokens = [tokenizer.unk_token for tokenizer in self.tokenizers]
